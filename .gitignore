@@ -1,0 +1,11 @@
+/target/
+project.properties
+
+# Netbeans files.
+nb-configuration.xml
+nbactions.xml
+
+# Eclipse files.
+# To create a project for it run "mvn eclipse:eclipse"
+.classpath
+.project
