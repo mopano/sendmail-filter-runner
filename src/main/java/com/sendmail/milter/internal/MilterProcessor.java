@@ -35,6 +35,8 @@ public class MilterProcessor {
 	private final MilterPacket packet = new MilterPacket();
 	private Properties lastProperties = null;
 	private final WritableByteChannel writeChannel;
+	private final IMilterActions actions;
+	private int mtaAflags;
 	private int mtaPflags;
 
 	/**
@@ -48,6 +50,7 @@ public class MilterProcessor {
 	public MilterProcessor(final WritableByteChannel writeChannel, final IMilterHandlerFactory factory) {
 		this.handler = factory.newInstance();
 		this.writeChannel = writeChannel;
+		actions = new MilterActionsImpl(writeChannel);
 	}
 
 	/**
@@ -64,7 +67,6 @@ public class MilterProcessor {
 			if (!processCurrentPacket()) {
 				return false;
 			}
-
 			packet.reset();
 		}
 
@@ -156,30 +158,32 @@ public class MilterProcessor {
 				break;
 			default:
 				LOG.error("Unhandled case [" + packet.getCommand() + "]", new Exception());
-				MilterServerPacketUtil.sendPacket(writeChannel, MilterConstants.SMFIR_CONTINUE, null);
+				MilterServerPacketUtil.sendPacket(writeChannel, MilterConstants.SMFIR_CONTINUE, (byte[]) null);
 				break;
 		}
 
 		return returnCode;
 	}
 
-	private void processOptnegPacket() throws IOException {
+	private boolean processOptnegPacket() throws IOException {
 		ByteBuffer data = packet.getData();
 		if (data.remaining() < 12) {
+			LOG.error("Options negotiation comes without version data and flags", new Exception());
 			// minimum number of byte data in negotiation header as MILTER_OPTLEN in mfdef.h
 			processAbortPacket();
 			sendReplyPacket(IMilterStatus.SMFIS_TEMPFAIL);
-			return;
+			return false;
 		}
 		int mtaProtVersion = data.getInt();
 		if (mtaProtVersion == 0) {
 			mtaProtVersion = 2;
 		}
 		// MTA action flags
-		int mtaAflags = data.getInt();
+		mtaAflags = data.getInt();
 		if (mtaAflags == 0) {
 			mtaAflags = MilterConstants.SMFI_V1_ACTS;
 		}
+
 		// MTA protocol flags
 		mtaPflags = data.getInt();
 		if (mtaPflags == 0) {
@@ -201,20 +205,26 @@ public class MilterProcessor {
 
 		if (fversion < 2) {
 			// Why would you use version lower than 2 in this decade?
+			LOG.error("Filter reported version under 2", new Exception());
 			processAbortPacket();
 			sendReplyPacket(IMilterStatus.SMFIS_TEMPFAIL);
-			return;
-		}
-		if ((factions & MilterConstants.SMFI_V2_ACTS) != factions) {
-			processAbortPacket();
-			sendReplyPacket(IMilterStatus.SMFIS_TEMPFAIL);
-			return;
+			return false;
 		}
 
-		if ((fprotocol & MilterConstants.SMFI_V2_PROT) != fprotocol) {
+		if ((factions & mtaAflags) != factions) {
+			LOG.error("Filter actions flags not supported",
+					new Exception(String.format("MTA %08X FILTER %08X\n", mtaAflags, factions)));
 			processAbortPacket();
 			sendReplyPacket(IMilterStatus.SMFIS_TEMPFAIL);
-			return;
+			return false;
+		}
+
+		if ((fprotocol & mtaPflags) != fprotocol) {
+			LOG.error("Filter protocol flags not supported",
+					new Exception(String.format("MTA %08X FILTER %08X", mtaPflags, fprotocol)));
+			processAbortPacket();
+			sendReplyPacket(IMilterStatus.SMFIS_TEMPFAIL);
+			return false;
 		}
 		if (fversion > mtaProtVersion) {
 			fversion = mtaProtVersion;
@@ -225,11 +235,13 @@ public class MilterProcessor {
 		bout.putInt(fversion);
 		bout.putInt(factions);
 		bout.putInt(fprotocol);
+		bout.flip();
 
 		Map<Integer, Set<String>> wantMacros = handler.getMacros();
 		// TODO: tell the MTA which macros we want.
 
 		MilterServerPacketUtil.sendPacket(writeChannel, MilterConstants.SMFIC_OPTNEG, bout);
+		return true;
 	}
 
 	private void processBodyPacket() throws IOException {
@@ -278,11 +290,10 @@ public class MilterProcessor {
 		final int consumes = handler.getProtocolFlags();
 		boolean returnCode = !isBitSet(MilterConstants.SMFIP_NR_EOH, consumes);
 		boolean simulateNoReturn = !isBitSet(MilterConstants.SMFIP_NR_EOH, mtaPflags);
-		IMilterActions eomactions = new MilterActionsImpl(writeChannel);
 
 		IMilterStatus result;
 		try {
-			result = handler.eoh(eomactions, lastProperties);
+			result = handler.eoh(actions, lastProperties);
 		}
 		catch (Throwable t) {
 			LOG.error("Handler threw an unhandled exception", t);
@@ -348,7 +359,6 @@ public class MilterProcessor {
 	}
 
 	private void processBodyEOBPacket() throws IOException {
-		IMilterActions actions = new MilterActionsImpl(writeChannel);
 
 		IMilterStatus result;
 		try {
@@ -446,7 +456,7 @@ public class MilterProcessor {
 	private void processMacroPacket() {
 		final ByteBuffer dataBuffer = packet.getData();
 		byte[][] propertiesStrings;
-	
+
 		// char cmdcode
 		dataBuffer.get();
 
